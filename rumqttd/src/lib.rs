@@ -34,7 +34,7 @@ use tokio_native_tls::native_tls;
 #[cfg(feature = "use-native-tls")]
 use tokio_native_tls::native_tls::Error as NativeTlsError;
 pub mod async_locallink;
-mod consolelink;
+pub mod consolelink;
 mod locallink;
 mod network;
 mod remotelink;

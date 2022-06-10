@@ -46,6 +46,10 @@ impl Tracker {
         }
     }
 
+    pub fn concrete_subscriptions_count(&self) -> usize {
+        self.concrete_subscriptions.len()
+    }
+
     pub fn busy_unschedule(&self) -> bool {
         self.busy_unschedule
     }

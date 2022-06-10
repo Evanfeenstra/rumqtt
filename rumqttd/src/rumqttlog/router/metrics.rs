@@ -48,4 +48,7 @@ impl ConnectionMetrics {
     pub fn new(id: String, tracker: Option<Tracker>) -> ConnectionMetrics {
         ConnectionMetrics { id, tracker }
     }
+    pub fn tracker(self) -> Option<Tracker> {
+        self.tracker
+    }
 }

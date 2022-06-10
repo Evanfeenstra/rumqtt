@@ -157,6 +157,9 @@ impl LinkBuilder {
 
         Ok((tx, rx))
     }
+    pub fn router_tx(self) -> jackiechan::Sender<(usize, Event)> {
+        self.router_tx.clone()
+    }
 }
 /// Returns a Router struct to run router on a thread, console server async task, mqtt servers async task, and a LinkBuilder to make local links
 pub fn construct_broker(
@@ -196,4 +199,26 @@ pub fn construct_broker(
     let builder = LinkBuilder { router_tx };
 
     (router, console, server, builder)
+}
+
+pub fn construct(config: Config) -> (Router, impl std::future::Future<Output = ()>, LinkBuilder) {
+    let (router, router_tx) = Router::new(Arc::new(config.router.clone()));
+
+    let server = config
+        .servers
+        .into_iter()
+        .map(|(id, config)| {
+            let router_tx = router_tx.clone();
+            async {
+                if let Err(e) = Server::new(id, config, router_tx).start().await {
+                    error!("Accept loop error: {:?}", e);
+                }
+            }
+        })
+        .collect::<FuturesUnordered<_>>()
+        .collect::<()>();
+
+    let builder = LinkBuilder { router_tx };
+
+    (router, server, builder)
 }

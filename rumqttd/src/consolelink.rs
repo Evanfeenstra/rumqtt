@@ -1,3 +1,4 @@
+use crate::rumqttlog::router::ConnectionMetrics;
 use crate::rumqttlog::ConnectionId;
 use crate::rumqttlog::{
     Connection, ConnectionAck, Event, MetricsReply, MetricsRequest, Notification, Receiver, Sender,
@@ -34,6 +35,22 @@ impl ConsoleLink {
             router_tx,
             link_rx,
         }
+    }
+    pub fn router_tx(self) -> jackiechan::Sender<(usize, Event)> {
+        self.router_tx.clone()
+    }
+}
+
+pub fn request_metrics(console: Arc<ConsoleLink>, client_id: String) -> ConnectionMetrics {
+    let message = Event::Metrics(MetricsRequest::Connection(client_id));
+    console.router_tx.send((console.id, message)).unwrap();
+
+    match console.link_rx.recv().unwrap() {
+        Notification::Metrics(MetricsReply::Connection(v)) => {
+            // println!("METRICS {:?}", v);
+            return v;
+        }
+        v => unreachable!("{:?}", v),
     }
 }
 
