@@ -156,6 +156,7 @@ pub struct ConnectionSettings {
     pub max_inflight_count: u16,
     pub max_inflight_size: usize,
     pub login_credentials: Option<Vec<ConnectionLoginCredentials>>,
+    pub sphinx_auth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

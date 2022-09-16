@@ -8,11 +8,11 @@ use crate::state::{self, State};
 use crate::{network, ConnectionSettings, Id};
 
 use log::{debug, trace, warn};
+use sphinx_auther::token::Token;
 use std::sync::Arc;
 use std::{io, mem};
 use tokio::time::{error::Elapsed, Duration};
 use tokio::{select, time};
-
 pub struct RemoteLink {
     config: Arc<ConnectionSettings>,
     connect: Connect,
@@ -68,8 +68,23 @@ impl RemoteLink {
         let mut connect = time::timeout(timeout, async {
             let connect = network.read_connect().await?;
 
+            if config.sphinx_auth {
+                let validated = match &connect.login {
+                    Some(l) => match Token::from_base64(&l.password) {
+                        Ok(t) => match t.recover_within(7) {
+                            Ok(pubkey) => pubkey.to_string() == l.username,
+                            Err(_) => false,
+                        },
+                        Err(_) => false,
+                    },
+                    None => false,
+                };
+                if !validated {
+                    return Err(Error::InvalidUsernameOrPassword);
+                }
+            }
             // Validate credentials if they exist
-            if let Some(credentials) = &config.login_credentials {
+            else if let Some(credentials) = &config.login_credentials {
                 let validated = match &connect.login {
                     Some(l) => {
                         let mut validated = false;
