@@ -3,9 +3,9 @@ use librumqttd::{Broker, Config};
 
 use std::path::PathBuf;
 
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+// #[cfg(not(target_env = "msvc"))]
+// #[global_allocator]
+// static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[derive(FromArgs, Debug)]
 /// Command line args for rumqttd
