@@ -1742,7 +1742,6 @@ dependencies = [
  "confy",
  "futures-util",
  "jackiechan",
- "jemallocator",
  "log",
  "pprof 0.4.5",
  "pretty_assertions 0.6.1",

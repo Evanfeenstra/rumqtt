@@ -68,12 +68,20 @@ impl RemoteLink {
         let mut connect = time::timeout(timeout, async {
             let connect = network.read_connect().await?;
 
-            if config.sphinx_auth {
+            if let Some(sphinx_auth) = &config.sphinx_auth {
                 let validated = match &connect.login {
                     Some(l) => match Token::from_base64(&l.password) {
-                        Ok(t) => match t.recover_within(7) {
-                            Ok(pubkey) => pubkey.to_string() == l.username,
-                            Err(_) => false,
+                        Ok(t) => {
+                            match sphinx_auth.within {
+                                Some(within) => match t.recover_within(within) {
+                                    Ok(pubkey) => pubkey.to_string() == l.username,
+                                    Err(_) => false,
+                                },
+                                None => match t.recover() {
+                                    Ok(pubkey) => pubkey.to_string() == l.username,
+                                    Err(_) => false,
+                                }
+                            }
                         },
                         Err(_) => false,
                     },

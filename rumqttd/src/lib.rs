@@ -148,6 +148,11 @@ pub struct ConnectionLoginCredentials {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SphinxLoginCredentials {
+    pub within: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConnectionSettings {
     pub connection_timeout_ms: u16,
     pub max_client_id_len: usize,
@@ -156,7 +161,7 @@ pub struct ConnectionSettings {
     pub max_inflight_count: u16,
     pub max_inflight_size: usize,
     pub login_credentials: Option<Vec<ConnectionLoginCredentials>>,
-    pub sphinx_auth: bool,
+    pub sphinx_auth: Option<SphinxLoginCredentials>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
