@@ -99,6 +99,11 @@ pub struct BridgeConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SphinxLoginCredentials {
+    pub within: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConnectionSettings {
     pub connection_timeout_ms: u16,
     pub throttle_delay_ms: u64,
@@ -106,6 +111,7 @@ pub struct ConnectionSettings {
     pub max_inflight_count: u16,
     pub max_inflight_size: usize,
     pub auth: Option<HashMap<String, String>>,
+    pub sphinx_auth: Option<SphinxLoginCredentials>,
     #[serde(default)]
     pub dynamic_filters: bool,
 }

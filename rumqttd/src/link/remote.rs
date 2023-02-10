@@ -14,6 +14,8 @@ use tokio::time::error::Elapsed;
 use tokio::{select, time};
 use tracing::{trace, Span};
 
+use sphinx_auther::token::Token;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("I/O")]
@@ -78,6 +80,30 @@ impl<P: Protocol> RemoteLink<P> {
             packet => return Err(Error::NotConnectPacket(packet)),
         };
         Span::current().record("client_id", &connect.client_id);
+
+        if let Some(auths) = &config.sphinx_auth {
+            let validated = match login.clone() {
+                Some(l) => match Token::from_base64(&l.password) {
+                    Ok(t) => {
+                        match auths.within {
+                            Some(within) => match t.recover_within(within) {
+                                Ok(pubkey) => pubkey.to_string() == l.username,
+                                Err(_) => false,
+                            },
+                            None => match t.recover() {
+                                Ok(pubkey) => pubkey.to_string() == l.username,
+                                Err(_) => false,
+                            }
+                        }
+                    },
+                    Err(_) => false,
+                },
+                None => false,
+            };
+            if !validated {
+                return Err(Error::InvalidAuth);
+            }
+        }
 
         // If authentication is configured in config file check for username and password
         if let Some(auths) = &config.auth {
