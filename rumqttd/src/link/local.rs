@@ -223,6 +223,25 @@ impl LinkTx {
         Ok(len)
     }
 
+     /// Sends a MQTT Publish to the router
+     pub fn publish_qos<S, V>(&mut self, topic: S, payload: V, qos: QoS) -> Result<usize, LinkError>
+     where
+         S: Into<Bytes>,
+         V: Into<Bytes>,
+     {
+         let publish = Publish {
+             dup: false,
+             qos: qos,
+             retain: false,
+             topic: topic.into(),
+             pkid: 0,
+             payload: payload.into(),
+         };
+ 
+         let len = self.push(Packet::Publish(publish, None))?;
+         Ok(len)
+     }
+
     /// Sends a MQTT Publish to the router
     pub fn try_publish<S, V>(&mut self, topic: S, payload: V) -> Result<usize, LinkError>
     where
