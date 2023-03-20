@@ -40,7 +40,7 @@ pub use link::meters;
 pub use router::{
     Alert, AlertError, AlertEvent, GetMeter, IncomingMeter, Meter, Notification, OutgoingMeter,
 };
-pub use server::Broker;
+pub use server::{AuthMsg, Broker};
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Config {
