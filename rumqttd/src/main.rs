@@ -81,7 +81,7 @@ fn main() {
     // println!("{:#?}", configs);
 
     let mut broker = Broker::new(configs);
-    broker.start().unwrap();
+    broker.start(None).unwrap();
 }
 
 fn banner() {

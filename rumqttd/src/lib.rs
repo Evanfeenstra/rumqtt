@@ -16,6 +16,8 @@ use tracing_subscriber::{
 
 use std::net::SocketAddr;
 
+pub use oneshot;
+
 mod link;
 pub mod protocol;
 mod router;
@@ -140,6 +142,12 @@ pub struct ConsoleSettings {
 }
 
 impl ConsoleSettings {
+    pub fn new(listen: &str) -> Self {
+        Self {
+            listen: listen.to_string(),
+            filter_handle: None,
+        }
+    }
     pub fn set_filter_reload_handle(&mut self, handle: ReloadHandle) {
         self.filter_handle.replace(handle);
     }

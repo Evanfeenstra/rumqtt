@@ -15,6 +15,7 @@ use crate::server::tls::{self, TLSAcceptor};
 use crate::{meters, ConnectionSettings, Filter, GetMeter, Meter};
 use flume::{RecvError, SendError, Sender};
 use std::net::SocketAddr;
+use std::sync::mpsc;
 use std::sync::Arc;
 use tracing::{error, field, info, Instrument};
 #[cfg(feature = "websockets")]
@@ -51,6 +52,23 @@ pub enum Error {
     Accept(String),
     #[error("Remote error = {0}")]
     Remote(#[from] remote::Error),
+}
+
+pub struct AuthMsg {
+    pub username: String,
+    pub password: String,
+    pub reply: oneshot::Sender<bool>
+}
+
+impl AuthMsg {
+    pub fn new(u: &str, p: &str) -> (Self, oneshot::Receiver<bool>) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        (Self {
+            username: u.to_string(),
+            password: p.to_string(),
+            reply: reply_tx
+        }, reply_rx)
+    }
 }
 
 pub struct Broker {
@@ -165,7 +183,7 @@ impl Broker {
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn start(&mut self) -> Result<(), Error> {
+    pub fn start(&mut self, auth_tx: Option<mpsc::Sender<AuthMsg>>) -> Result<(), Error> {
         // spawn bridge in a separate thread
         if let Some(bridge_config) = self.config.bridge.clone() {
             let bridge_thread = thread::Builder::new().name(bridge_config.name.clone());
@@ -185,7 +203,7 @@ impl Broker {
         // spawn servers in a separate thread
         for (_, config) in self.config.v4.clone() {
             let server_thread = thread::Builder::new().name(config.name.clone());
-            let server = Server::new(config, self.router_tx.clone(), V4);
+            let server = Server::new(config, self.router_tx.clone(), V4, auth_tx.clone());
             server_thread.spawn(move || {
                 let mut runtime = tokio::runtime::Builder::new_current_thread();
                 let runtime = runtime.enable_all().build().unwrap();
@@ -201,7 +219,7 @@ impl Broker {
         if let Some(v5_config) = &self.config.v5 {
             for (_, config) in v5_config.clone() {
                 let server_thread = thread::Builder::new().name(config.name.clone());
-                let server = Server::new(config, self.router_tx.clone(), V5);
+                let server = Server::new(config, self.router_tx.clone(), V5, auth_tx.clone());
                 server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
@@ -225,6 +243,7 @@ impl Broker {
                     Ws {
                         codec: MessageCodec::server(),
                     },
+                    auth_tx.clone()
                 );
                 server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
@@ -314,6 +333,7 @@ struct Server<P> {
     config: ServerSettings,
     router_tx: Sender<(ConnectionId, Event)>,
     protocol: P,
+    auth_tx: Option<mpsc::Sender<AuthMsg>>
 }
 
 impl<P: Protocol + Clone + Send + 'static> Server<P> {
@@ -321,11 +341,13 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
         config: ServerSettings,
         router_tx: Sender<(ConnectionId, Event)>,
         protocol: P,
+        auth_tx: Option<mpsc::Sender<AuthMsg>>,
     ) -> Server<P> {
         Server {
             config,
             router_tx,
             protocol,
+            auth_tx,
         }
     }
 
@@ -391,7 +413,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                     )),
                 ),
                 LinkType::Remote => task::spawn(
-                    remote(config, tenant_id.clone(), router_tx, network, protocol).instrument(
+                    remote(config, tenant_id.clone(), router_tx, network, protocol, self.auth_tx.clone()).instrument(
                         tracing::error_span!(
                             "remote_link",
                             ?tenant_id,
@@ -418,11 +440,12 @@ async fn remote<P: Protocol>(
     router_tx: Sender<(ConnectionId, Event)>,
     stream: Box<dyn N>,
     protocol: P,
+    auth_tx: Option<mpsc::Sender<AuthMsg>>
 ) {
     let network = Network::new(stream, config.max_payload_size, 100, protocol);
     // Start the link
     let mut link =
-        match RemoteLink::new(config, router_tx.clone(), tenant_id.clone(), network).await {
+        match RemoteLink::new(config, router_tx.clone(), tenant_id.clone(), network, auth_tx).await {
             Ok(l) => l,
             Err(e) => {
                 error!(error=?e, "Remote link error");

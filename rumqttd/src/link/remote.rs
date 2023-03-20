@@ -3,12 +3,13 @@ use crate::link::network;
 use crate::link::network::Network;
 use crate::protocol::{Connect, Packet, Protocol};
 use crate::router::{Event, Notification};
+use crate::server::AuthMsg;
 use crate::{ConnectionId, ConnectionSettings};
 
 use flume::{RecvError, SendError, Sender, TrySendError};
 use std::collections::VecDeque;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use tokio::time::error::Elapsed;
 use tokio::{select, time};
@@ -61,6 +62,7 @@ impl<P: Protocol> RemoteLink<P> {
         router_tx: Sender<(ConnectionId, Event)>,
         tenant_id: Option<String>,
         mut network: Network<P>,
+        auth_tx: Option<mpsc::Sender<AuthMsg>>
     ) -> Result<RemoteLink<P>, Error> {
         // Wait for MQTT connect packet and error out if it's not received in time to prevent
         // DOS attacks by filling total connections that the server can handle with idle open
@@ -79,20 +81,36 @@ impl<P: Protocol> RemoteLink<P> {
         };
         Span::current().record("client_id", &connect.client_id);
 
-        // If authentication is configured in config file check for username and password
-        if let Some(auths) = &config.auth {
-            // if authentication is configured and connect packet doesn't have login details return
-            // an error
+        if let Some(atx) = auth_tx {
             if let Some(login) = login {
-                let is_authenticated = auths
-                    .iter()
-                    .any(|(user, pass)| (user, pass) == (&login.username, &login.password));
-
-                if !is_authenticated {
+                let (authmsg, reply) = AuthMsg::new(&login.username.to_string(), &login.password.to_string());
+                let _ = atx.send(authmsg);
+                if let Ok(auth_ok) = reply.recv() {
+                    if !auth_ok {
+                        return Err(Error::InvalidAuth);
+                    }
+                } else {
                     return Err(Error::InvalidAuth);
                 }
             } else {
                 return Err(Error::InvalidAuth);
+            }
+        } else {
+            // If authentication is configured in config file check for username and password
+            if let Some(auths) = &config.auth {
+                // if authentication is configured and connect packet doesn't have login details return
+                // an error
+                if let Some(login) = login {
+                    let is_authenticated = auths
+                        .iter()
+                        .any(|(user, pass)| (user, pass) == (&login.username, &login.password));
+
+                    if !is_authenticated {
+                        return Err(Error::InvalidAuth);
+                    }
+                } else {
+                    return Err(Error::InvalidAuth);
+                }
             }
         }
 

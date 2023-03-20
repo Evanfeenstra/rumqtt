@@ -32,7 +32,8 @@ tracing-subscriber = { version="0.3.16", features=["env-filter"] }
 metrics = "0.20.1"
 metrics-exporter-prometheus = "0.11.0"
 clap = { version = "4.1.4", features = ["derive"] }
-axum = "0.6.4"
+axum = "0.6.1"
+oneshot = "0.1.5"
 
 [features]
 default = ["use-rustls"]
