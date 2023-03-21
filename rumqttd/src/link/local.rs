@@ -133,6 +133,7 @@ impl Link {
     }
 }
 
+#[derive(Clone)]
 pub struct LinkTx {
     pub(crate) connection_id: ConnectionId,
     router_tx: Sender<(ConnectionId, Event)>,
