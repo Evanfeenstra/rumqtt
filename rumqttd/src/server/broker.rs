@@ -403,7 +403,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                         }
                     };
                     task::spawn(
-                        remote(config, tenant_id.clone(), router_tx, stream, protocol).instrument(
+                        remote(config, tenant_id.clone(), router_tx, stream, protocol, self.auth_tx.clone()).instrument(
                             tracing::info_span!(
                                 "websocket_link",
                                 client_id = field::Empty,
