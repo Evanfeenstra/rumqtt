@@ -1,8 +1,9 @@
 use crate::protocol::{
-    ConnAck, ConnectReturnCode, Packet, PingResp, PubAck, PubAckReason, PubComp, PubCompReason,
-    PubRel, PubRelReason, Publish, QoS, SubAck, SubscribeReasonCode, UnsubAck,
+    ConnAck, ConnAckProperties, ConnectReturnCode, Disconnect, DisconnectReasonCode, Packet,
+    PingResp, PubAck, PubAckReason, PubComp, PubCompReason, PubRel, PubRelReason, Publish,
+    PublishProperties, QoS, SubAck, SubscribeReasonCode, UnsubAck, UnsubAckReason,
 };
-use crate::router::alertlog::{AlertError, AlertEvent};
+use crate::router::alertlog::alert;
 use crate::router::graveyard::SavedState;
 use crate::router::scheduler::{PauseReason, Tracker};
 use crate::router::Forward;
@@ -18,14 +19,14 @@ use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
 use super::alertlog::{Alert, AlertLog};
+use super::connection::BrokerAliases;
 use super::graveyard::Graveyard;
 use super::iobufs::{Incoming, Outgoing};
 use super::logs::{AckLog, DataLog};
 use super::scheduler::{ScheduleReason, Scheduler};
 use super::{
-    packetid, Connection, DataRequest, Event, FilterIdx, GetMeter, Meter, MetricsReply,
-    MetricsRequest, Notification, RouterMeter, ShadowRequest, MAX_CHANNEL_CAPACITY,
-    MAX_SCHEDULE_ITERATIONS,
+    packetid, Connection, DataRequest, Event, FilterIdx, Meter, Notification, Print, RouterMeter,
+    ShadowRequest, MAX_CHANNEL_CAPACITY, MAX_SCHEDULE_ITERATIONS,
 };
 
 #[derive(Error, Debug)]
@@ -49,9 +50,11 @@ pub enum RouterError {
     InvalidFilterPrefix(Filter),
     #[error("Invalid client_id {0}")]
     InvalidClientId(String),
+    #[error("Disconnection (Reason: {0:?})")]
+    Disconnect(DisconnectReasonCode),
 }
 
-type FilterWithOffsets = Vec<(Filter, Offset)>;
+const TOPIC_ALIAS_MAX: u16 = 4096;
 
 pub struct Router {
     id: RouterId,
@@ -61,9 +64,9 @@ pub struct Router {
     /// Saved state of dead persistent connections
     graveyard: Graveyard,
     /// List of MetersLink's senders
-    meters: Slab<Sender<(ConnectionId, Vec<Meter>)>>,
+    meters: Slab<Sender<Vec<Meter>>>,
     /// List of AlertsLink's senders with their respective subscription Filter
-    alerts: Slab<(FilterWithOffsets, Sender<(ConnectionId, Alert)>)>,
+    alerts: Slab<Sender<Vec<Alert>>>,
     /// List of connections
     connections: Slab<Connection>,
     /// Connection map from device id to connection id
@@ -127,7 +130,7 @@ impl Router {
             ibufs,
             obufs,
             datalog: DataLog::new(config.clone()).unwrap(),
-            alertlog: AlertLog::new(config).unwrap(),
+            alertlog: AlertLog::new(config),
             ackslog,
             scheduler: Scheduler::with_capacity(max_connections),
             notifications: VecDeque::with_capacity(1024),
@@ -219,12 +222,12 @@ impl Router {
             self.consume();
         }
 
-        self.send_all_alerts();
+        // self.send_all_alerts();
         Ok(())
     }
 
     fn events(&mut self, id: ConnectionId, data: Event) {
-        let span = tracing::info_span!("[>] incoming", connection_id = id);
+        let span = tracing::error_span!("[>] incoming", connection_id = id);
         let _guard = span.enter();
 
         match data {
@@ -234,15 +237,22 @@ impl Router {
                 outgoing,
             } => self.handle_new_connection(connection, incoming, outgoing),
             Event::NewMeter(tx) => self.handle_new_meter(tx),
-            Event::GetMeter(meter) => self.handle_get_meter(id, meter),
-            Event::NewAlert(tx, filters) => self.handle_new_alert(tx, filters),
+            Event::NewAlert(tx) => self.handle_new_alert(tx),
             Event::DeviceData => self.handle_device_payload(id),
-            Event::Disconnect(disconnect) => self.handle_disconnection(id, disconnect.execute_will),
+            Event::Disconnect(disconnect) => {
+                self.handle_disconnection(id, disconnect.execute_will, None)
+            }
             Event::Ready => self.scheduler.reschedule(id, ScheduleReason::Ready),
             Event::Shadow(request) => {
                 retrieve_shadow(&mut self.datalog, &mut self.obufs[id], request)
             }
-            Event::Metrics(metrics) => retrieve_metrics(self, metrics),
+            Event::SendAlerts => {
+                self.send_alerts();
+            }
+            Event::SendMeters => {
+                self.send_meters();
+            }
+            Event::PrintStatus(metrics) => print_status(self, metrics),
         }
     }
 
@@ -271,7 +281,7 @@ impl Router {
                     "Duplicate client_id, dropping previous connection with connection_id: {}",
                     connection_id
                 );
-                self.handle_disconnection(*connection_id, true);
+                self.handle_disconnection(*connection_id, true, None);
             }
         }
 
@@ -327,23 +337,19 @@ impl Router {
             .check_tracker_duplicates(connection_id)
             .is_none());
 
-        let alert = Alert::event(client_id.clone(), AlertEvent::Connect);
-        match append_to_alertlog(alert, &mut self.alertlog) {
-            Ok(_offset) => {}
-            Err(e) => {
-                error!(
-                    reason = ?e, "Failed to append to alertlog"
-                );
-            }
-        }
-
         let ack = ConnAck {
             session_present: !clean_session && previous_session,
             code: ConnectReturnCode::Success,
         };
 
+        let properties = ConnAckProperties {
+            // TODO: set this to some appropriate value
+            topic_alias_max: Some(TOPIC_ALIAS_MAX),
+            ..Default::default()
+        };
+
         let ackslog = self.ackslog.get_mut(connection_id).unwrap();
-        ackslog.connack(connection_id, ack);
+        ackslog.connack(connection_id, ack, Some(properties));
 
         self.scheduler
             .reschedule(connection_id, ScheduleReason::Init);
@@ -351,30 +357,20 @@ impl Router {
         self.router_meters.total_connections += 1;
     }
 
-    fn handle_new_meter(&mut self, tx: Sender<(ConnectionId, Vec<Meter>)>) {
-        let meter_id = self.meters.insert(tx);
-        let tx = &self.meters[meter_id];
-        let _ = tx.try_send((
-            meter_id,
-            vec![Meter::Router(self.id, self.router_meters.clone())],
-        ));
+    fn handle_new_meter(&mut self, tx: Sender<Vec<Meter>>) {
+        let _meter_id = self.meters.insert(tx);
     }
 
-    fn handle_new_alert(&mut self, tx: Sender<(ConnectionId, Alert)>, filters: Vec<Filter>) {
-        let mut filter_with_offsets = Vec::new();
-        for filter in filters {
-            let offset = self.prepare_alert_filter(filter.to_string());
-            filter_with_offsets.push((filter, offset));
-        }
-        let alert_id = self.alerts.insert((filter_with_offsets, tx));
-        let (_, tx) = self.alerts.get(alert_id).unwrap();
-        let _ = tx.try_send((
-            alert_id,
-            Alert::event("AlertsLink".to_owned(), AlertEvent::Connect),
-        ));
+    fn handle_new_alert(&mut self, tx: Sender<Vec<Alert>>) {
+        let _alert_id = self.alerts.insert(tx);
     }
 
-    fn handle_disconnection(&mut self, id: ConnectionId, execute_last_will: bool) {
+    fn handle_disconnection(
+        &mut self,
+        id: ConnectionId,
+        execute_last_will: bool,
+        reason: Option<DisconnectReasonCode>,
+    ) {
         // Some clients can choose to send Disconnect packet before network disconnection.
         // This will lead to double Disconnect packets in router `events`
         let client_id = match &self.obufs.get(id) {
@@ -384,24 +380,38 @@ impl Router {
                 return;
             }
         };
-        let alert = Alert::event(client_id.clone(), AlertEvent::Disconnect);
-        match append_to_alertlog(alert, &mut self.alertlog) {
-            Ok(_offset) => {}
-            Err(e) => {
-                error!(
-                    reason = ?e, "Failed to append to alertlog"
-                );
-            }
-        }
 
         let span = tracing::info_span!("incoming_disconnect", client_id);
         let _guard = span.enter();
 
+        // must handle last will before sending disconnect packet
+        // as the disconnecting client might have subscribed to will topic.
         if execute_last_will {
             self.handle_last_will(id);
         }
 
         info!("Disconnecting connection");
+
+        if let Some(reason_code) = reason {
+            let outgoing = match self.obufs.get_mut(id) {
+                Some(v) => v,
+                None => {
+                    error!("no-connection id {} is already gone", id);
+                    return;
+                }
+            };
+
+            let disconnect = Disconnect { reason_code };
+
+            let disconnect_notification = Notification::Disconnect(disconnect, None);
+
+            outgoing
+                .data_buffer
+                .lock()
+                .push_back(disconnect_notification);
+
+            outgoing.handle.try_send(()).ok();
+        }
 
         // Remove connection from router
         let mut connection = self.connections.remove(id);
@@ -412,7 +422,7 @@ impl Router {
         self.ackslog.remove(id);
 
         // Don't remove connection id from readyqueue with index. This will
-        // remove wrong connection from readyqueue. Instead just leave diconnected
+        // remove wrong connection from readyqueue. Instead just leave disconnected
         // connection in readyqueue and allow 'consume()' method to deal with this
         // self.readyqueue.remove(id);
 
@@ -474,7 +484,7 @@ impl Router {
         };
 
         let client_id = incoming.client_id.clone();
-        let span = tracing::info_span!("incoming_payload", client_id);
+        let span = tracing::error_span!("incoming_payload", client_id);
         let _guard = span.enter();
 
         // Instead of exchanging, we should just append new incoming packets inside cache
@@ -483,15 +493,15 @@ impl Router {
         let mut force_ack = false;
         let mut new_data = false;
         let mut disconnect = false;
+        let mut disconnect_reason: Option<DisconnectReasonCode> = None;
         let mut execute_will = true;
 
         // info!("{:15.15}[I] {:20} count = {}", client_id, "packets", packets.len());
 
         for packet in packets.drain(0..) {
             match packet {
-                Packet::Publish(publish, _) => {
-                    let span =
-                        tracing::info_span!("publish", topic = ?publish.topic, pkid = publish.pkid);
+                Packet::Publish(mut publish, properties) => {
+                    let span = tracing::error_span!("publish", topic = ?publish.topic, pkid = publish.pkid);
                     let _guard = span.enter();
 
                     let qos = publish.qos;
@@ -543,10 +553,16 @@ impl Router {
 
                     self.router_meters.total_publishes += 1;
 
+                    // Ignore retained messages
+                    if publish.retain {
+                        publish.retain = false;
+                    }
+
                     // Try to append publish to commitlog
                     match append_to_commitlog(
                         id,
                         publish.clone(),
+                        properties,
                         &mut self.datalog,
                         &mut self.notifications,
                         &mut self.connections,
@@ -564,6 +580,11 @@ impl Router {
                             );
                             self.router_meters.failed_publishes += 1;
                             disconnect = true;
+
+                            if let RouterError::Disconnect(code) = e {
+                                disconnect_reason = Some(code)
+                            }
+
                             break;
                         }
                     };
@@ -612,18 +633,6 @@ impl Router {
                         return_codes.push(code);
                     }
 
-                    let alert = Alert::event(client_id.clone(), AlertEvent::Subscribe(subscribe));
-                    match append_to_alertlog(alert, &mut self.alertlog) {
-                        Ok(_offset) => {
-                            new_data = true;
-                        }
-                        Err(e) => {
-                            error!(
-                                reason = ?e, "Failed to append to alertlog"
-                            );
-                        }
-                    }
-
                     // let meter = &mut self.ibufs.get_mut(id).unwrap().meter;
                     // meter.total_size += len;
 
@@ -657,28 +666,20 @@ impl Router {
                                 continue;
                             }
 
+                            if let Some(broker_aliases) = connection.broker_topic_aliases.as_mut() {
+                                broker_aliases.remove_alias(filter);
+                            }
+
                             let unsuback = UnsubAck {
                                 pkid,
                                 // reasons are used in MQTTv5
-                                reasons: vec![],
+                                reasons: vec![UnsubAckReason::Success],
                             };
                             let ackslog = self.ackslog.get_mut(id).unwrap();
                             ackslog.unsuback(unsuback);
                             self.scheduler.untrack(id, filter);
                             self.datalog.remove_waiters_for_id(id, filter);
                             force_ack = true;
-                        }
-                    }
-                    let alert =
-                        Alert::event(client_id.clone(), AlertEvent::Unsubscribe(unsubscribe));
-                    match append_to_alertlog(alert, &mut self.alertlog) {
-                        Ok(_offset) => {
-                            new_data = true;
-                        }
-                        Err(e) => {
-                            error!(
-                                reason = ?e, "Failed to append to alertlog"
-                            );
                         }
                     }
                 }
@@ -739,6 +740,7 @@ impl Router {
                     match append_to_commitlog(
                         id,
                         publish,
+                        None,
                         &mut self.datalog,
                         &mut self.notifications,
                         &mut self.connections,
@@ -770,18 +772,6 @@ impl Router {
                 Packet::Disconnect(_, _) => {
                     let span = tracing::info_span!("disconnect");
                     let _guard = span.enter();
-
-                    let alert = Alert::event(client_id, AlertEvent::Disconnect);
-                    match append_to_alertlog(alert, &mut self.alertlog) {
-                        Ok(_offset) => {
-                            new_data = true;
-                        }
-                        Err(e) => {
-                            error!(
-                                reason = ?e, "Failed to append to alertlog"
-                            );
-                        }
-                    }
                     disconnect = true;
                     execute_will = false;
                     break;
@@ -815,14 +805,8 @@ impl Router {
         // on say 5th packet should not block new data notifications for packets
         // 1 - 4. Hence we use a flag instead of diconnecting immediately
         if disconnect {
-            self.handle_disconnection(id, execute_will);
+            self.handle_disconnection(id, execute_will, disconnect_reason);
         }
-    }
-
-    /// Apply filter and prepare this connection to receive subscription data
-    fn prepare_alert_filter(&mut self, filter: String) -> Offset {
-        let (_, offset) = self.alertlog.next_native_offset(&filter);
-        offset
     }
 
     /// Apply filter and prepare this connection to receive subscription data
@@ -895,6 +879,9 @@ impl Router {
         // We always try to ack when ever a connection is scheduled
         ack_device_data(ackslog, outgoing);
 
+        let connection = &mut self.connections[id];
+        let broker_topic_aliases = &mut connection.broker_topic_aliases;
+
         // A new connection's tracker is always initialized with acks request.
         // A subscribe will register data request.
         // So a new connection is always scheduled with at least one request
@@ -911,7 +898,13 @@ impl Router {
                 }
             };
 
-            match forward_device_data(&mut request, datalog, outgoing, alertlog) {
+            match forward_device_data(
+                &mut request,
+                datalog,
+                outgoing,
+                alertlog,
+                broker_topic_aliases,
+            ) {
                 ConsumeStatus::BufferFull => {
                     requests.push_back(request);
                     self.scheduler.pause(id, PauseReason::Busy);
@@ -949,6 +942,7 @@ impl Router {
             None => return,
         };
 
+        error!("Unexpected: last will not unset");
         let publish = Publish {
             dup: false,
             qos: will.qos,
@@ -957,9 +951,12 @@ impl Router {
             pkid: 0,
             payload: will.message,
         };
+
+        let properties = None;
         match append_to_commitlog(
             id,
             publish,
+            properties,
             &mut self.datalog,
             &mut self.notifications,
             &mut self.connections,
@@ -982,117 +979,65 @@ impl Router {
         };
     }
 
-    fn handle_get_meter(&self, meter_id: ConnectionId, meter: router::GetMeter) {
-        let meter_tx = &self.meters[meter_id];
-        match meter {
-            GetMeter::Router => {
-                let router_meters = Meter::Router(self.id, self.router_meters.clone());
-                let _ = meter_tx.try_send((meter_id, vec![router_meters]));
+    fn send_meters(&mut self) {
+        let mut meters = Vec::with_capacity(10);
+        if let Some(router_meter) = self.router_meters.get() {
+            meters.push(Meter::Router(self.id, router_meter));
+        }
+        for f in self.subscription_map.keys() {
+            let filter = f.to_owned();
+            if let Some(subscription_meter) = self.datalog.meter(f).and_then(|meter| meter.get()) {
+                meters.push(Meter::Subscription(filter, subscription_meter));
             }
-            GetMeter::Connection(client_id) => {
-                let connections = match client_id {
-                    Some(client_id) => {
-                        if let Some(connection_id) = self.connection_map.get(&client_id) {
-                            vec![(client_id, connection_id)]
-                        } else {
-                            let meter = Meter::Connection("".to_owned(), None, None);
-                            let _ = meter_tx.try_send((meter_id, vec![meter]));
-                            return;
-                        }
-                    }
-                    // send meters for all connections
-                    None => self
-                        .connection_map
-                        .iter()
-                        .map(|(k, v)| (k.to_owned(), v))
-                        .collect(),
-                };
+        }
 
-                // Update metrics
-                let mut meter = Vec::new();
-                for (client_id, connection_id) in connections {
-                    let incoming_meter = self.ibufs.get(*connection_id).map(|v| v.meter.clone());
-                    let outgoing_meter = self.obufs.get(*connection_id).map(|v| v.meter.clone());
-                    meter.push(Meter::Connection(client_id, incoming_meter, outgoing_meter));
+        if !meters.is_empty() {
+            for (meter_id, link) in self.meters.iter() {
+                if let Err(e) = link.try_send(meters.clone()) {
+                    error!(meter_id, "Failed to send meter. Error = {:?}", e);
                 }
-
-                let _ = meter_tx.try_send((meter_id, meter));
             }
-            GetMeter::Subscription(filter) => {
-                let filters = match filter {
-                    Some(filter) => vec![filter],
-                    None => self.subscription_map.keys().map(|k| k.to_owned()).collect(),
-                };
-
-                let mut meter = Vec::new();
-                for filter in filters {
-                    let subscription_meter = self.datalog.meter(&filter);
-                    meter.push(Meter::Subscription(filter, subscription_meter));
-                }
-
-                let _ = meter_tx.try_send((meter_id, meter));
-            }
-        };
+        }
     }
-    fn send_all_alerts(&mut self) {
-        let span = tracing::info_span!("outgoing_alert");
-        let _guard = span.enter();
 
-        for (alert_id, (filter_with_offsets, alert_sender)) in &mut self.alerts {
-            for (filter, offset) in filter_with_offsets {
-                trace!("Reading from alertlog: {}", filter);
-                let (alerts, next_offset) = self
-                    .alertlog
-                    .native_readv(filter.to_string(), *offset, 100)
-                    .unwrap();
-                for alert in alerts {
-                    let res = alert_sender.try_send((alert_id, alert.0));
-                    if res.is_err() {
-                        error!(
-                        "Cannot send Alert to the channel, Error: {:?}. Dropping alerts for alert_id: {}",
-                        res, alert_id
-                    );
-                    }
+    fn send_alerts(&mut self) {
+        let alerts = self.alertlog.take();
+
+        if !alerts.is_empty() {
+            let alerts: Vec<Alert> = alerts.into();
+            for (meter_id, link) in self.alerts.iter() {
+                if let Err(e) = link.try_send(alerts.clone()) {
+                    error!(meter_id, "Failed to send alert. Error = {:?}", e);
                 }
-                *offset = next_offset;
             }
         }
     }
 }
 
-fn append_to_alertlog(alert: Alert, alertlog: &mut AlertLog) -> Result<Offset, RouterError> {
-    let topic = alert.topic();
-
-    let filter_idxs = alertlog.matches(&topic).expect("Should never be None");
-
-    let mut o = (0, 0);
-    for filter_idx in filter_idxs {
-        let alertlog_entry = alertlog.native.get_mut(filter_idx).unwrap();
-        let (offset, filter) = alertlog_entry.append(alert.clone());
-        debug!(
-            "Appended to alertlog: {}[{}, {})",
-            filter, offset.0, offset.1,
-        );
-
-        o = offset;
-    }
-
-    // error!("{:15.15}[E] {:20} topic = {}", connections[id].client_id, "no-filter", topic);
-    Ok(o)
-}
-
 fn append_to_commitlog(
     id: ConnectionId,
     mut publish: Publish,
+    mut properties: Option<PublishProperties>,
     datalog: &mut DataLog,
     notifications: &mut VecDeque<(ConnectionId, DataRequest)>,
     connections: &mut Slab<Connection>,
 ) -> Result<Offset, RouterError> {
+    let connection = connections.get_mut(id).unwrap();
+
+    let topic_alias = properties.as_mut().and_then(|p| {
+        // clear the received value as it is irrelevant while forwarding publishes
+        p.topic_alias.take()
+    });
+
+    if let Some(alias) = topic_alias {
+        validate_and_set_topic_alias(&mut publish, connection, alias)?;
+    };
+
     let topic = std::str::from_utf8(&publish.topic)?;
 
     // Ensure that only clients associated with a tenant can publish to tenant's topic
     #[cfg(feature = "validate-tenant-prefix")]
-    if let Some(tenant_prefix) = &connections[id].tenant_prefix {
+    if let Some(tenant_prefix) = &connection.tenant_prefix {
         if !topic.starts_with(tenant_prefix) {
             return Err(RouterError::BadTenant(
                 tenant_prefix.to_owned(),
@@ -1104,7 +1049,8 @@ fn append_to_commitlog(
     if publish.payload.is_empty() {
         datalog.remove_from_retained_publishes(topic.to_owned());
     } else if publish.retain {
-        datalog.insert_to_retained_publishes(publish.clone(), topic.to_owned());
+        error!("Unexpected: retain field was not unset");
+        datalog.insert_to_retained_publishes(publish.clone(), properties.clone(), topic.to_owned());
     }
 
     publish.retain = false;
@@ -1115,7 +1061,7 @@ fn append_to_commitlog(
     // Create a dynamic filter if dynamic_filters are enabled for this connection
     let filter_idxs = match filter_idxs {
         Some(v) => v,
-        None if connections[id].dynamic_filters => {
+        None if connection.dynamic_filters => {
             let (idx, _cursor) = datalog.next_native_offset(topic);
             vec![idx]
         }
@@ -1125,7 +1071,8 @@ fn append_to_commitlog(
     let mut o = (0, 0);
     for filter_idx in filter_idxs {
         let datalog = datalog.native.get_mut(filter_idx).unwrap();
-        let (offset, filter) = datalog.append(publish.clone(), notifications);
+        let publish_data = (publish.clone(), properties.clone());
+        let (offset, filter) = datalog.append(publish_data.into(), notifications);
         debug!(
             pkid,
             "Appended to commitlog: {}[{}, {})", filter, offset.0, offset.1,
@@ -1136,6 +1083,39 @@ fn append_to_commitlog(
 
     // error!("{:15.15}[E] {:20} topic = {}", connections[id].client_id, "no-filter", topic);
     Ok(o)
+}
+
+fn validate_and_set_topic_alias(
+    publish: &mut Publish,
+    connection: &mut Connection,
+    alias: u16,
+) -> Result<(), RouterError> {
+    if alias == 0 || alias > TOPIC_ALIAS_MAX {
+        error!("Alias must be greater than 0 and <={TOPIC_ALIAS_MAX}");
+        return Err(RouterError::Disconnect(
+            DisconnectReasonCode::TopicAliasInvalid,
+        ));
+    }
+
+    if publish.topic.is_empty() {
+        // if publish topic is empty, publisher must have set a valid alias
+        let Some(alias_topic) = connection.topic_aliases.get(&alias) else {
+                error!("Empty topic name with invalid alias");
+                return Err(RouterError::Disconnect(
+                    DisconnectReasonCode::ProtocolError,
+                ));
+            };
+        // set the publish topic before further processing
+        publish.topic = alias_topic.to_owned().into();
+    } else {
+        // if publish topic isn't empty, that means
+        // publisher wants to establish new mapping for topic & alias
+        let topic = std::str::from_utf8(&publish.topic)?;
+        connection.topic_aliases.insert(alias, topic.to_owned());
+        trace!("set alias {alias} for topic {topic}");
+    };
+
+    Ok(())
 }
 
 /// Sweep ackslog for all the pending acks.
@@ -1191,6 +1171,7 @@ fn forward_device_data(
     datalog: &DataLog,
     outgoing: &mut Outgoing,
     alertlog: &mut AlertLog,
+    broker_topic_aliases: &mut Option<BrokerAliases>,
 ) -> ConsumeStatus {
     let span = tracing::info_span!("outgoing_publish", client_id = outgoing.client_id);
     let _guard = span.enter();
@@ -1239,15 +1220,8 @@ fn forward_device_data(
             error
         );
 
-        let alert = Alert::error(outgoing.client_id.clone(), AlertError::CursorJump(error));
-        match append_to_alertlog(alert, alertlog) {
-            Ok(_offset) => (),
-            Err(e) => {
-                error!(
-                    reason = ?e, "Failed to append to alertlog"
-                );
-            }
-        }
+        let alert = alert::cursorjump(&outgoing.client_id, &request.filter, 0);
+        alertlog.log(alert);
     }
 
     trace!(
@@ -1268,15 +1242,44 @@ fn forward_device_data(
         return ConsumeStatus::FilterCaughtup;
     }
 
+    let mut topic_alias = broker_topic_aliases
+        .as_ref()
+        .and_then(|aliases| aliases.get_alias(&request.filter));
+
+    let topic_alias_already_exists = topic_alias.is_some();
+
+    // if topic alias doesn't exists, try creating new one!
+    if !topic_alias_already_exists {
+        topic_alias = broker_topic_aliases
+            .as_mut()
+            .and_then(|broker_aliases| broker_aliases.set_new_alias(&request.filter))
+    }
+
     // Fill and notify device data
-    let forwards = publishes.into_iter().map(|(mut publish, offset)| {
-        publish.qos = protocol::qos(qos).unwrap();
-        Forward {
-            cursor: offset,
-            size: 0,
-            publish,
-        }
-    });
+    let forwards = publishes
+        .into_iter()
+        .map(|((mut publish, mut properties), offset)| {
+            publish.qos = protocol::qos(qos).unwrap();
+
+            // if there is some topic alias to use, set it in publish properties
+            if topic_alias.is_some() {
+                let mut props = properties.unwrap_or_default();
+                props.topic_alias = topic_alias;
+                properties = Some(props);
+            }
+
+            // We want to clear topic if we are using an existing alias
+            if topic_alias_already_exists {
+                publish.topic.clear()
+            }
+
+            Forward {
+                cursor: offset,
+                size: 0,
+                publish,
+                properties,
+            }
+        });
 
     let (len, inflight) = outgoing.push_forwards(forwards, qos, filter_idx);
 
@@ -1307,7 +1310,7 @@ fn forward_device_data(
 
 fn retrieve_shadow(datalog: &mut DataLog, outgoing: &mut Outgoing, shadow: ShadowRequest) {
     if let Some(reply) = datalog.shadow(&shadow.filter) {
-        let publish = reply;
+        let publish = reply.0;
         let shadow_reply = router::ShadowReply {
             topic: publish.topic,
             payload: publish.payload,
@@ -1323,11 +1326,17 @@ fn retrieve_shadow(datalog: &mut DataLog, outgoing: &mut Outgoing, shadow: Shado
     }
 }
 
-fn retrieve_metrics(router: &mut Router, metrics: MetricsRequest) {
-    let message = match metrics {
-        MetricsRequest::Config => MetricsReply::Config(router.config.clone()),
-        MetricsRequest::Router => MetricsReply::Router(router.router_meters.clone()),
-        MetricsRequest::Connection(id) => {
+fn print_status(router: &mut Router, metrics: Print) {
+    match metrics {
+        Print::Config => {
+            let config = router.config.clone();
+            println!("{config:#?}");
+        }
+        Print::Router => {
+            let metrics = router.router_meters.clone();
+            println!("{metrics:#?}");
+        }
+        Print::Connection(id) => {
             let metrics = router.connection_map.get(&id).map(|v| {
                 let c = router
                     .connections
@@ -1346,9 +1355,9 @@ fn retrieve_metrics(router: &mut Router, metrics: MetricsRequest) {
                     .map(|v| (v.metrics, v.tracker)),
             };
 
-            MetricsReply::Connection(metrics)
+            println!("{metrics:#?}");
         }
-        MetricsRequest::Subscriptions => {
+        Print::Subscriptions => {
             let metrics: HashMap<Filter, Vec<String>> = router
                 .subscription_map
                 .iter()
@@ -1362,30 +1371,28 @@ fn retrieve_metrics(router: &mut Router, metrics: MetricsRequest) {
                 })
                 .collect();
 
-            MetricsReply::Subscriptions(metrics)
+            println!("{metrics:#?}");
         }
-        MetricsRequest::Subscription(filter) => {
+        Print::Subscription(filter) => {
             let metrics = router.datalog.meter(&filter);
-            MetricsReply::Subscription(metrics)
+            println!("{metrics:#?}");
         }
-        MetricsRequest::Waiters(filter) => {
-            let metrics = router.datalog.waiters(&filter).map(|v| {
-                // Convert (connection id, data request) list to (device id, data request) list
-                v.waiters()
+        Print::Waiters(filter) => {
+            if let Some(waiters) = router.datalog.waiters(&filter) {
+                let v: Vec<(String, DataRequest)> = waiters
+                    .waiters()
                     .iter()
                     .map(|(id, request)| (router.obufs[*id].client_id.clone(), request.clone()))
-                    .collect()
-            });
+                    .collect();
 
-            MetricsReply::Waiters(metrics)
+                println!("{v:#?}");
+            }
         }
-        MetricsRequest::ReadyQueue => {
+        Print::ReadyQueue => {
             let metrics = router.scheduler.readyqueue.clone();
-            MetricsReply::ReadyQueue(metrics)
+            println!("{metrics:#?}");
         }
     };
-
-    println!("{message:#?}");
 }
 
 fn validate_subscription(

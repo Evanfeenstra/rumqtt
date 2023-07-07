@@ -75,11 +75,15 @@ impl<P: Protocol> RemoteLink<P> {
         })
         .await??;
 
-        let (connect, lastwill, login) = match packet {
-            Packet::Connect(connect, _, lastwill, _, login) => (connect, lastwill, login),
+        let (connect, props, lastwill, login) = match packet {
+            Packet::Connect(connect, props, _lastwill, _, login) => {
+                Span::current().record("client_id", &connect.client_id);
+
+                // Ignore last will
+                (connect, props, None, login)
+            }
             packet => return Err(Error::NotConnectPacket(packet)),
         };
-        Span::current().record("client_id", &connect.client_id);
 
         if let Some(atx) = auth_tx {
             if let Some(login) = login {
@@ -133,6 +137,8 @@ impl<P: Protocol> RemoteLink<P> {
             return Err(Error::InvalidClientId);
         }
 
+        let topic_alias_max = props.and_then(|p| p.topic_alias_max);
+
         let (link_tx, link_rx, notification) = Link::new(
             tenant_id,
             &client_id,
@@ -140,7 +146,9 @@ impl<P: Protocol> RemoteLink<P> {
             clean_session,
             lastwill,
             dynamic_filters,
+            topic_alias_max,
         )?;
+
         let id = link_rx.id();
         Span::current().record("connection_id", id);
 

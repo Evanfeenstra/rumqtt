@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-
+- Support for Websocket connections (#633)
 ### Changed
 
 ### Deprecated
@@ -16,10 +16,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Fixed
+- Include reason code for UnsubAck in v5
 
 ### Security
 
 ---
+
+## [rumqttd 0.15.0] - 30-05-2023
+
+### Added
+- Support for topic alias and message expiry in v5 (#616)
+
+### Changed
+- Certificate paths configured in config file are checked during startup and throws a panic if it is not valid. (#610)
+
+### Deprecated
+
+### Removed
+
+### Fixed
+- MQTTv5: Read the Unsubscribe package in match arms (#625)
+
+### Security
+
+## [rumqttd 0.14.0] - 31-03-2023
+
+### Added
+- `PrometheusSetting` now takes `listen` to specify listener address instead of default `127.0.0.1`. Do not use `listen` and `port` together.
+
+### Deprecated
+- `PrometheusSetting`'s `port` will be removed in favour of `listen`.
+
+### Removed
+- **Breaking:** Remove retained messages and lastwill features
+
+
+## [rumqttd 0.13.0] - 08-03-2023
+
+- No change, only version bump
+
+## [rumqttd 0.12.7] - 04-03-2023
+
+### Changed
+- Re-design meters and alerts (#579)
 
 ## [rumqttd 0.12.6] - 14-02-2023
 

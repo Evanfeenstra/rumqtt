@@ -1,5 +1,5 @@
 use crate::link::local::{Link, LinkRx};
-use crate::router::{Event, MetricsRequest};
+use crate::router::{Event, Print};
 use crate::{ConnectionId, ConsoleSettings};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -23,7 +23,8 @@ impl ConsoleLink {
     /// Requires the corresponding Router to be running to complete
     pub fn new(config: ConsoleSettings, router_tx: Sender<(ConnectionId, Event)>) -> ConsoleLink {
         let tx = router_tx.clone();
-        let (link_tx, link_rx, _ack) = Link::new(None, "console", tx, true, None, true).unwrap();
+        let (link_tx, link_rx, _ack) =
+            Link::new(None, "console", tx, true, None, true, None).unwrap();
         let connection_id = link_tx.connection_id;
         ConsoleLink {
             config,
@@ -66,7 +67,7 @@ async fn config(State(console): State<Arc<ConsoleLink>>) -> impl IntoResponse {
 }
 
 async fn router(State(console): State<Arc<ConsoleLink>>) -> impl IntoResponse {
-    let event = Event::Metrics(MetricsRequest::Router);
+    let event = Event::PrintStatus(Print::Router);
     let message = (console.connection_id, event);
     if console.router_tx.send(message).is_err() {
         return Response::builder().status(404).body("".to_owned()).unwrap();
@@ -79,7 +80,7 @@ async fn device_with_id(
     Path(device_id): Path<String>,
     State(console): State<Arc<ConsoleLink>>,
 ) -> impl IntoResponse {
-    let event = Event::Metrics(MetricsRequest::Connection(device_id));
+    let event = Event::PrintStatus(Print::Connection(device_id));
     let message = (console.connection_id, event);
     if console.router_tx.send(message).is_err() {
         return Response::builder().status(404).body("".to_owned()).unwrap();
@@ -89,7 +90,7 @@ async fn device_with_id(
 }
 
 async fn subscriptions(State(console): State<Arc<ConsoleLink>>) -> impl IntoResponse {
-    let event = Event::Metrics(MetricsRequest::Subscriptions);
+    let event = Event::PrintStatus(Print::Subscriptions);
     let message = (console.connection_id, event);
     if console.router_tx.send(message).is_err() {
         return Response::builder().status(404).body("".to_owned()).unwrap();
@@ -103,7 +104,7 @@ async fn subscriptions_with_filter(
     State(console): State<Arc<ConsoleLink>>,
 ) -> impl IntoResponse {
     let filter = filter.replace('.', "/");
-    let event = Event::Metrics(MetricsRequest::Subscription(filter));
+    let event = Event::PrintStatus(Print::Subscription(filter));
     let message = (console.connection_id, event);
     if console.router_tx.send(message).is_err() {
         return Response::builder().status(404).body("".to_owned()).unwrap();
@@ -117,7 +118,7 @@ async fn waiters_with_filter(
     State(console): State<Arc<ConsoleLink>>,
 ) -> impl IntoResponse {
     let filter = filter.replace('.', "/");
-    let event = Event::Metrics(MetricsRequest::Waiters(filter));
+    let event = Event::PrintStatus(Print::Waiters(filter));
     let message = (console.connection_id, event);
     if console.router_tx.send(message).is_err() {
         return Response::builder().status(404).body("".to_owned()).unwrap();
@@ -127,7 +128,7 @@ async fn waiters_with_filter(
 }
 
 async fn readyqueue(State(console): State<Arc<ConsoleLink>>) -> impl IntoResponse {
-    let event = Event::Metrics(MetricsRequest::ReadyQueue);
+    let event = Event::PrintStatus(Print::ReadyQueue);
     let message = (console.connection_id, event);
     if console.router_tx.send(message).is_err() {
         return Response::builder().status(404).body("".to_owned()).unwrap();
