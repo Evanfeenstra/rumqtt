@@ -60,7 +60,7 @@ fn main() {
     }
 
     thread::spawn(move || {
-        if let Err(e) = broker.start() {
+        if let Err(e) = broker.start(None) {
             println!("Broker stopped: {e}");
         }
     });

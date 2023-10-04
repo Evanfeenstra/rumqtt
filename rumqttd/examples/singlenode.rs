@@ -28,7 +28,7 @@ fn main() {
     let mut broker = Broker::new(config);
     let (mut link_tx, mut link_rx) = broker.link("singlenode").unwrap();
     thread::spawn(move || {
-        broker.start().unwrap();
+        broker.start(None).unwrap();
     });
 
     link_tx.subscribe("#").unwrap();

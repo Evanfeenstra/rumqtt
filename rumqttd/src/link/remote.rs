@@ -3,13 +3,13 @@ use crate::link::network;
 use crate::link::network::Network;
 use crate::protocol::{Connect, Packet, Protocol};
 use crate::router::{Event, Notification};
-use crate::server::AuthMsg;
+use crate::server::{AuthLogin, AuthMsg, AuthMsgType};
 use crate::{ConnectionId, ConnectionSettings};
 
 use flume::{RecvError, SendError, Sender, TrySendError};
 use std::collections::VecDeque;
 use std::io;
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 use tokio::time::error::Elapsed;
 use tokio::{select, time};
@@ -62,7 +62,7 @@ impl<P: Protocol> RemoteLink<P> {
         router_tx: Sender<(ConnectionId, Event)>,
         tenant_id: Option<String>,
         mut network: Network<P>,
-        auth_tx: Option<mpsc::Sender<AuthMsg>>
+        auth_tx: Option<mpsc::Sender<AuthMsg>>,
     ) -> Result<RemoteLink<P>, Error> {
         // Wait for MQTT connect packet and error out if it's not received in time to prevent
         // DOS attacks by filling total connections that the server can handle with idle open
@@ -85,13 +85,19 @@ impl<P: Protocol> RemoteLink<P> {
             packet => return Err(Error::NotConnectPacket(packet)),
         };
 
-        if let Some(atx) = auth_tx {
+        let mut usr = None;
+        if let Some(atx) = &auth_tx {
             if let Some(login) = login {
-                let (authmsg, reply) = AuthMsg::new(&login.username.to_string(), &login.password.to_string());
+                let (authmsg, reply) = AuthMsg::new(AuthMsgType::Login(AuthLogin {
+                    username: login.username.to_string(),
+                    password: login.password,
+                }));
                 let _ = atx.send(authmsg);
                 if let Ok(auth_ok) = reply.recv() {
                     if !auth_ok {
                         return Err(Error::InvalidAuth);
+                    } else {
+                        usr = Some(login.username);
                     }
                 } else {
                     return Err(Error::InvalidAuth);
@@ -147,6 +153,8 @@ impl<P: Protocol> RemoteLink<P> {
             lastwill,
             dynamic_filters,
             topic_alias_max,
+            auth_tx,
+            usr,
         )?;
 
         let id = link_rx.id();

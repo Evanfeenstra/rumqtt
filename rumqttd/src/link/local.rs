@@ -6,6 +6,7 @@ use crate::router::{
     iobufs::{Incoming, Outgoing},
     Connection, Event, Notification, ShadowRequest,
 };
+use crate::server::{AuthMsg, AuthMsgType, AuthPublish, AuthSubscribe};
 use crate::ConnectionId;
 use bytes::Bytes;
 use flume::{Receiver, RecvError, RecvTimeoutError, SendError, Sender, TrySendError};
@@ -14,13 +15,16 @@ use parking_lot::{Mutex, RawMutex};
 
 use std::collections::VecDeque;
 use std::mem;
-use std::sync::Arc;
+use std::str::from_utf8;
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {
     #[error("Unexpected router message")]
     NotConnectionAck,
+    #[error("Unauthorized")]
+    Unauthorized,
     #[error("ConnAck error {0}")]
     ConnectionAck(String),
     #[error("Channel try send error")]
@@ -83,6 +87,8 @@ impl Link {
         last_will: Option<LastWill>,
         dynamic_filters: bool,
         topic_alias_max: Option<u16>,
+        auth_tx: Option<mpsc::Sender<AuthMsg>>,
+        username: Option<String>,
     ) -> Result<(LinkTx, LinkRx, Notification), LinkError> {
         // Connect to router
         // Local connections to the router shall have access to all subscriptions
@@ -107,7 +113,7 @@ impl Link {
             _message => return Err(LinkError::NotConnectionAck),
         };
 
-        let tx = LinkTx::new(id, router_tx.clone(), i);
+        let tx = LinkTx::new(id, router_tx.clone(), i, auth_tx, username);
         let rx = LinkRx::new(id, router_tx, link_rx, o);
         Ok((tx, rx, notification))
     }
@@ -120,6 +126,8 @@ impl Link {
         last_will: Option<LastWill>,
         dynamic_filters: bool,
         topic_alias_max: Option<u16>,
+        auth_tx: Option<mpsc::Sender<AuthMsg>>,
+        username: Option<String>,
     ) -> Result<(LinkTx, LinkRx, ConnAck), LinkError> {
         // Connect to router
         // Local connections to the router shall have access to all subscriptions
@@ -143,7 +151,7 @@ impl Link {
             _message => return Err(LinkError::NotConnectionAck),
         };
 
-        let tx = LinkTx::new(id, router_tx.clone(), i);
+        let tx = LinkTx::new(id, router_tx.clone(), i, auth_tx, username);
         let rx = LinkRx::new(id, router_tx, link_rx, o);
         Ok((tx, rx, ack))
     }
@@ -154,6 +162,8 @@ pub struct LinkTx {
     pub(crate) connection_id: ConnectionId,
     router_tx: Sender<(ConnectionId, Event)>,
     recv_buffer: Arc<Mutex<VecDeque<Packet>>>,
+    auth_tx: Option<mpsc::Sender<AuthMsg>>,
+    username: Option<String>,
 }
 
 impl LinkTx {
@@ -161,11 +171,15 @@ impl LinkTx {
         connection_id: ConnectionId,
         router_tx: Sender<(ConnectionId, Event)>,
         recv_buffer: Arc<Mutex<VecDeque<Packet>>>,
+        auth_tx: Option<mpsc::Sender<AuthMsg>>,
+        username: Option<String>,
     ) -> LinkTx {
         LinkTx {
             connection_id,
             router_tx,
             recv_buffer,
+            auth_tx,
+            username,
         }
     }
 
@@ -236,6 +250,8 @@ impl LinkTx {
             payload: payload.into(),
         };
 
+        self.maybe_pub(&publish.topic)?;
+
         let len = self.push(Packet::Publish(publish, None))?;
         Ok(len)
     }
@@ -255,6 +271,8 @@ impl LinkTx {
             payload: payload.into(),
         };
 
+        self.maybe_pub(&publish.topic)?;
+
         let len = self.try_push(Packet::Publish(publish, None))?;
         // TODO: Remote item in buffer after failure and write unittest
         Ok(len)
@@ -269,6 +287,8 @@ impl LinkTx {
             preserve_retain: false,
             retain_forward_rule: RetainForwardRule::Never,
         }];
+
+        self.maybe_sub(&filters.get(0).unwrap().path)?;
 
         let subscribe = Subscribe { pkid: 0, filters };
 
@@ -286,10 +306,55 @@ impl LinkTx {
             retain_forward_rule: RetainForwardRule::Never,
         }];
 
+        self.maybe_sub(&filters.get(0).unwrap().path)?;
+
         let subscribe = Subscribe { pkid: 0, filters };
 
         let len = self.try_push(Packet::Subscribe(subscribe, None))?;
         Ok(len)
+    }
+
+    fn maybe_sub(&self, topic: &str) -> Result<(), LinkError> {
+        if let Some(auth_tx) = &self.auth_tx {
+            if let Some(username) = &self.username {
+                return Self::maybe_auth(
+                    auth_tx,
+                    AuthMsgType::Subscribe(AuthSubscribe {
+                        username: username.to_string(),
+                        topic: topic.to_string(),
+                    }),
+                );
+            }
+        }
+        Ok(())
+    }
+    fn maybe_pub(&self, topic: &Bytes) -> Result<(), LinkError> {
+        if let Some(auth_tx) = &self.auth_tx {
+            if let Some(username) = &self.username {
+                let t = from_utf8(topic).map_err(|_| LinkError::Unauthorized)?;
+                return Self::maybe_auth(
+                    auth_tx,
+                    AuthMsgType::Publish(AuthPublish {
+                        username: username.to_string(),
+                        topic: t.to_string(),
+                    }),
+                );
+            }
+        }
+        Ok(())
+    }
+    fn maybe_auth(
+        auth_tx: &mpsc::Sender<AuthMsg>,
+        auth_type: AuthMsgType,
+    ) -> Result<(), LinkError> {
+        let (msg, reply) = AuthMsg::new(auth_type);
+        let _ = auth_tx.send(msg);
+        if let Ok(auth_ok) = reply.recv() {
+            if !auth_ok {
+                return Err(LinkError::Unauthorized);
+            }
+        }
+        Ok(())
     }
 
     /// Request to get device shadow
@@ -420,7 +485,7 @@ mod test {
 
         for i in 0..CONNECTIONS {
             let buffer = Arc::new(Mutex::new(VecDeque::new()));
-            let mut link_tx = LinkTx::new(i, router_tx.clone(), buffer.clone());
+            let mut link_tx = LinkTx::new(i, router_tx.clone(), buffer.clone(), None, None);
             buffers.push(buffer);
             thread::spawn(move || {
                 for _ in 0..MESSAGES_PER_CONNECTION {

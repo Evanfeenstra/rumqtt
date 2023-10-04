@@ -24,7 +24,7 @@ impl ConsoleLink {
     pub fn new(config: ConsoleSettings, router_tx: Sender<(ConnectionId, Event)>) -> ConsoleLink {
         let tx = router_tx.clone();
         let (link_tx, link_rx, _ack) =
-            Link::new(None, "console", tx, true, None, true, None).unwrap();
+            Link::new(None, "console", tx, true, None, true, None, None, None).unwrap();
         let connection_id = link_tx.connection_id;
         ConsoleLink {
             config,
