@@ -6,7 +6,7 @@ use crate::router::{
     iobufs::{Incoming, Outgoing},
     Connection, Event, Notification, ShadowRequest,
 };
-use crate::server::{AuthMsg, AuthMsgType, AuthPublish, AuthSubscribe};
+use crate::server::{AuthMsg, AuthPublish, AuthSubscribe, AuthType};
 use crate::ConnectionId;
 use bytes::Bytes;
 use flume::{Receiver, RecvError, RecvTimeoutError, SendError, Sender, TrySendError};
@@ -319,7 +319,7 @@ impl LinkTx {
             if let Some(username) = &self.username {
                 return Self::maybe_auth(
                     auth_tx,
-                    AuthMsgType::Subscribe(AuthSubscribe {
+                    AuthType::Subscribe(AuthSubscribe {
                         username: username.to_string(),
                         topic: topic.to_string(),
                     }),
@@ -334,7 +334,7 @@ impl LinkTx {
                 let t = from_utf8(topic).map_err(|_| LinkError::Unauthorized)?;
                 return Self::maybe_auth(
                     auth_tx,
-                    AuthMsgType::Publish(AuthPublish {
+                    AuthType::Publish(AuthPublish {
                         username: username.to_string(),
                         topic: t.to_string(),
                     }),
@@ -343,10 +343,7 @@ impl LinkTx {
         }
         Ok(())
     }
-    fn maybe_auth(
-        auth_tx: &mpsc::Sender<AuthMsg>,
-        auth_type: AuthMsgType,
-    ) -> Result<(), LinkError> {
+    fn maybe_auth(auth_tx: &mpsc::Sender<AuthMsg>, auth_type: AuthType) -> Result<(), LinkError> {
         let (msg, reply) = AuthMsg::new(auth_type);
         let _ = auth_tx.send(msg);
         if let Ok(auth_ok) = reply.recv() {

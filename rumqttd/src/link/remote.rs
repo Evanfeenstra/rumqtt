@@ -3,7 +3,7 @@ use crate::link::network;
 use crate::link::network::Network;
 use crate::protocol::{Connect, Packet, Protocol};
 use crate::router::{Event, Notification};
-use crate::server::{AuthLogin, AuthMsg, AuthMsgType};
+use crate::server::{AuthLogin, AuthMsg, AuthType};
 use crate::{ConnectionId, ConnectionSettings};
 
 use flume::{RecvError, SendError, Sender, TrySendError};
@@ -88,7 +88,7 @@ impl<P: Protocol> RemoteLink<P> {
         let mut usr = None;
         if let Some(atx) = &auth_tx {
             if let Some(login) = login {
-                let (authmsg, reply) = AuthMsg::new(AuthMsgType::Login(AuthLogin {
+                let (authmsg, reply) = AuthMsg::new(AuthType::Login(AuthLogin {
                     username: login.username.to_string(),
                     password: login.password,
                 }));

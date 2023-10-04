@@ -71,18 +71,18 @@ pub struct AuthPublish {
     pub username: String,
     pub topic: String,
 }
-pub enum AuthMsgType {
+pub enum AuthType {
     Login(AuthLogin),
     Subscribe(AuthSubscribe),
     Publish(AuthPublish),
 }
 pub struct AuthMsg {
-    pub msg: AuthMsgType,
+    pub msg: AuthType,
     pub tx: oneshot::Sender<bool>,
 }
 
 impl AuthMsg {
-    pub fn new(msg: AuthMsgType) -> (Self, oneshot::Receiver<bool>) {
+    pub fn new(msg: AuthType) -> (Self, oneshot::Receiver<bool>) {
         let (tx, reply_rx) = oneshot::channel();
         (Self { msg, tx }, reply_rx)
     }
