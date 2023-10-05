@@ -105,8 +105,6 @@ pub struct Router {
     cache: Option<VecDeque<Packet>>,
     // auth tx
     auth_tx: Option<mpsc::Sender<AuthMsg>>,
-    // username
-    username: String,
 }
 
 impl Router {
@@ -114,7 +112,6 @@ impl Router {
         router_id: RouterId,
         config: RouterConfig,
         auth_tx: Option<mpsc::Sender<AuthMsg>>,
-        username: &str,
     ) -> Router {
         let (router_tx, router_rx) = bounded(1000);
 
@@ -152,7 +149,6 @@ impl Router {
             router_meters: router_metrics,
             cache: Some(VecDeque::with_capacity(MAX_CHANNEL_CAPACITY)),
             auth_tx,
-            username: username.to_string(),
         }
     }
 
@@ -522,6 +518,22 @@ impl Router {
                     let qos = publish.qos;
                     let pkid = publish.pkid;
 
+                    let connection = self.connections.get_mut(id).unwrap();
+                    if let Some(atx) = &self.auth_tx {
+                        if let Ok(top) = std::str::from_utf8(&publish.topic) {
+                            if let Err(_e) = maybe_auth(
+                                &atx,
+                                AuthType::Publish(AuthPublish {
+                                    client_id: connection.client_id.clone(),
+                                    topic: top.to_string(),
+                                }),
+                            ) {
+                                disconnect = true;
+                                break;
+                            }
+                        }
+                    }
+
                     // Prepare acks for the above publish
                     // If any of the publish in the batch results in force flush,
                     // set global force flush flag. Force flush is triggered when the
@@ -624,7 +636,7 @@ impl Router {
                         info!("Adding subscription on topic {}", f.path);
                         let connection = self.connections.get_mut(id).unwrap();
 
-                        if let Err(e) = validate_subscription(connection, f) {
+                        if let Err(e) = validate_subscription(connection, f, &self.auth_tx) {
                             warn!(reason = ?e,"Subscription cannot be validated: {}", e);
 
                             disconnect = true;
@@ -1027,47 +1039,6 @@ impl Router {
             }
         }
     }
-
-    fn maybe_sub(&self, topic: &str) -> Result<(), RouterError> {
-        if let Some(auth_tx) = &self.auth_tx {
-            if let Some(username) = &self.username {
-                return Self::maybe_auth(
-                    auth_tx,
-                    AuthType::Subscribe(AuthSubscribe {
-                        username: username.to_string(),
-                        topic: topic.to_string(),
-                    }),
-                );
-            }
-        }
-        Ok(())
-    }
-    fn maybe_pub(&self, topic: &Bytes) -> Result<(), RouterError> {
-        if let Some(auth_tx) = &self.auth_tx {
-            if let Some(username) = &self.username {
-                let t = from_utf8(topic).map_err(|_| LinkError::Unauthorized)?;
-                return Self::maybe_auth(
-                    auth_tx,
-                    AuthType::Publish(AuthPublish {
-                        username: username.to_string(),
-                        topic: t.to_string(),
-                    }),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn maybe_auth(auth_tx: &mpsc::Sender<AuthMsg>, auth_type: AuthType) -> Result<(), RouterError> {
-        let (msg, reply) = AuthMsg::new(auth_type);
-        let _ = auth_tx.send(msg);
-        if let Ok(auth_ok) = reply.recv() {
-            if !auth_ok {
-                return Err(RouterError::Unauthorized);
-            }
-        }
-        Ok(())
-    }
 }
 
 fn append_to_commitlog(
@@ -1452,6 +1423,7 @@ fn print_status(router: &mut Router, metrics: Print) {
 fn validate_subscription(
     connection: &mut Connection,
     filter: &protocol::Filter,
+    auth_tx: &Option<mpsc::Sender<AuthMsg>>,
 ) -> Result<(), RouterError> {
     trace!(
         "validate subscription = {}, tenant = {:?}",
@@ -1466,6 +1438,16 @@ fn validate_subscription(
         }
     }
 
+    if let Some(atx) = auth_tx {
+        maybe_auth(
+            atx,
+            AuthType::Subscribe(AuthSubscribe {
+                client_id: connection.client_id.clone(),
+                topic: filter.path.to_owned(),
+            }),
+        )?;
+    }
+
     if filter.qos == QoS::ExactlyOnce {
         return Err(RouterError::UnsupportedQoS(filter.qos));
     }
@@ -1474,6 +1456,17 @@ fn validate_subscription(
         return Err(RouterError::InvalidFilterPrefix(filter.path.to_owned()));
     }
 
+    Ok(())
+}
+
+fn maybe_auth(auth_tx: &mpsc::Sender<AuthMsg>, auth_type: AuthType) -> Result<(), RouterError> {
+    let (msg, reply) = AuthMsg::new(auth_type);
+    let _ = auth_tx.send(msg);
+    if let Ok(auth_ok) = reply.recv() {
+        if !auth_ok {
+            return Err(RouterError::Unauthorized);
+        }
+    }
     Ok(())
 }
 

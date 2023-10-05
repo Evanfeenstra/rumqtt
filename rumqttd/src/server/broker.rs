@@ -60,15 +60,16 @@ pub enum Error {
 }
 
 pub struct AuthLogin {
+    pub client_id: String,
     pub username: String,
     pub password: String,
 }
 pub struct AuthSubscribe {
-    pub username: String,
+    pub client_id: String,
     pub topic: String,
 }
 pub struct AuthPublish {
-    pub username: String,
+    pub client_id: String,
     pub topic: String,
 }
 pub enum AuthType {

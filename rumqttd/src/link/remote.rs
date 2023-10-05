@@ -85,9 +85,12 @@ impl<P: Protocol> RemoteLink<P> {
             packet => return Err(Error::NotConnectPacket(packet)),
         };
 
+        let client_id = connect.client_id.clone();
+
         if let Some(atx) = auth_tx {
             if let Some(login) = login {
                 let (authmsg, reply) = AuthMsg::new(AuthType::Login(AuthLogin {
+                    client_id: client_id.clone(),
                     username: login.username.to_string(),
                     password: login.password,
                 }));
@@ -129,7 +132,6 @@ impl<P: Protocol> RemoteLink<P> {
 
         // Register this connection with the router. Router replys with ack which if ok will
         // start the link. Router can sometimes reject the connection (ex max connection limit)
-        let client_id = connect.client_id.clone();
         let clean_session = connect.clean_session;
 
         if cfg!(feature = "allow-duplicate-clientid") {
