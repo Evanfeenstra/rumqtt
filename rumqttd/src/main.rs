@@ -82,8 +82,8 @@ fn main() {
 
     // println!("{:#?}", configs);
 
-    let mut broker = Broker::new(configs);
-    broker.start(None).unwrap();
+    let mut broker = Broker::new(configs, None);
+    broker.start().unwrap();
 }
 
 // Do any extra validation that needs to be done before starting the broker here.

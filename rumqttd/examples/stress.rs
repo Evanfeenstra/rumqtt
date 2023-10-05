@@ -37,7 +37,7 @@ async fn main() {
         .unwrap(); // Config::default() doesn't have working values
 
     let config = config.try_deserialize().unwrap();
-    let broker = Broker::new(config);
+    let broker = Broker::new(config, None);
 
     for i in 0..CONSUMERS {
         let client_id = format!("consumer_{i}");

@@ -8,11 +8,13 @@ use crate::router::graveyard::SavedState;
 use crate::router::scheduler::{PauseReason, Tracker};
 use crate::router::Forward;
 use crate::segments::Position;
+use crate::server::{AuthMsg, AuthPublish, AuthSubscribe, AuthType};
 use crate::*;
 use flume::{bounded, Receiver, RecvError, Sender, TryRecvError};
 use slab::Slab;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::Utf8Error;
+use std::sync::mpsc;
 use std::thread;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -37,6 +39,8 @@ pub enum RouterError {
     TryRecv(#[from] TryRecvError),
     #[error("Disconnection")]
     Disconnected,
+    #[error("Unauthorized")]
+    Unauthorized,
     #[error("Topic not utf-8")]
     NonUtf8Topic(#[from] Utf8Error),
     #[cfg(feature = "validate-tenant-prefix")]
@@ -99,10 +103,19 @@ pub struct Router {
     router_meters: RouterMeter,
     /// Buffer for cache exchange of incoming packets
     cache: Option<VecDeque<Packet>>,
+    // auth tx
+    auth_tx: Option<mpsc::Sender<AuthMsg>>,
+    // username
+    username: String,
 }
 
 impl Router {
-    pub fn new(router_id: RouterId, config: RouterConfig) -> Router {
+    pub fn new(
+        router_id: RouterId,
+        config: RouterConfig,
+        auth_tx: Option<mpsc::Sender<AuthMsg>>,
+        username: &str,
+    ) -> Router {
         let (router_tx, router_rx) = bounded(1000);
 
         let meters = Slab::with_capacity(10);
@@ -138,6 +151,8 @@ impl Router {
             router_tx,
             router_meters: router_metrics,
             cache: Some(VecDeque::with_capacity(MAX_CHANNEL_CAPACITY)),
+            auth_tx,
+            username: username.to_string(),
         }
     }
 
@@ -1012,6 +1027,47 @@ impl Router {
             }
         }
     }
+
+    fn maybe_sub(&self, topic: &str) -> Result<(), RouterError> {
+        if let Some(auth_tx) = &self.auth_tx {
+            if let Some(username) = &self.username {
+                return Self::maybe_auth(
+                    auth_tx,
+                    AuthType::Subscribe(AuthSubscribe {
+                        username: username.to_string(),
+                        topic: topic.to_string(),
+                    }),
+                );
+            }
+        }
+        Ok(())
+    }
+    fn maybe_pub(&self, topic: &Bytes) -> Result<(), RouterError> {
+        if let Some(auth_tx) = &self.auth_tx {
+            if let Some(username) = &self.username {
+                let t = from_utf8(topic).map_err(|_| LinkError::Unauthorized)?;
+                return Self::maybe_auth(
+                    auth_tx,
+                    AuthType::Publish(AuthPublish {
+                        username: username.to_string(),
+                        topic: t.to_string(),
+                    }),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn maybe_auth(auth_tx: &mpsc::Sender<AuthMsg>, auth_type: AuthType) -> Result<(), RouterError> {
+        let (msg, reply) = AuthMsg::new(auth_type);
+        let _ = auth_tx.send(msg);
+        if let Ok(auth_ok) = reply.recv() {
+            if !auth_ok {
+                return Err(RouterError::Unauthorized);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn append_to_commitlog(
@@ -1100,11 +1156,9 @@ fn validate_and_set_topic_alias(
     if publish.topic.is_empty() {
         // if publish topic is empty, publisher must have set a valid alias
         let Some(alias_topic) = connection.topic_aliases.get(&alias) else {
-                error!("Empty topic name with invalid alias");
-                return Err(RouterError::Disconnect(
-                    DisconnectReasonCode::ProtocolError,
-                ));
-            };
+            error!("Empty topic name with invalid alias");
+            return Err(RouterError::Disconnect(DisconnectReasonCode::ProtocolError));
+        };
         // set the publish topic before further processing
         publish.topic = alias_topic.to_owned().into();
     } else {

@@ -59,33 +59,46 @@ pub enum Error {
     Remote(#[from] remote::Error),
 }
 
-pub struct AuthMsg {
+pub struct AuthLogin {
     pub username: String,
     pub password: String,
-    pub reply: oneshot::Sender<bool>
+}
+pub struct AuthSubscribe {
+    pub username: String,
+    pub topic: String,
+}
+pub struct AuthPublish {
+    pub username: String,
+    pub topic: String,
+}
+pub enum AuthType {
+    Login(AuthLogin),
+    Subscribe(AuthSubscribe),
+    Publish(AuthPublish),
+}
+pub struct AuthMsg {
+    pub msg: AuthType,
+    pub tx: oneshot::Sender<bool>,
 }
 
 impl AuthMsg {
-    pub fn new(u: &str, p: &str) -> (Self, oneshot::Receiver<bool>) {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        (Self {
-            username: u.to_string(),
-            password: p.to_string(),
-            reply: reply_tx
-        }, reply_rx)
+    pub fn new(msg: AuthType) -> (Self, oneshot::Receiver<bool>) {
+        let (tx, reply_rx) = oneshot::channel();
+        (Self { msg, tx }, reply_rx)
     }
 }
 
 pub struct Broker {
     config: Arc<Config>,
     router_tx: Sender<(ConnectionId, Event)>,
+    auth_tx: Option<mpsc::Sender<AuthMsg>>,
 }
 
 impl Broker {
-    pub fn new(config: Config) -> Broker {
+    pub fn new(config: Config, auth_tx: Option<mpsc::Sender<AuthMsg>>) -> Broker {
         let config = Arc::new(config);
         let router_config = config.router.clone();
-        let router: Router = Router::new(config.id, router_config);
+        let router: Router = Router::new(config.id, router_config, auth_tx.clone());
 
         // Setup cluster if cluster settings are configured.
         match config.cluster.clone() {
@@ -99,11 +112,19 @@ impl Broker {
                 // Start router first and then cluster in the background
                 let router_tx = router.spawn();
                 // cluster.spawn();
-                Broker { config, router_tx }
+                Broker {
+                    config,
+                    router_tx,
+                    auth_tx,
+                }
             }
             None => {
                 let router_tx = router.spawn();
-                Broker { config, router_tx }
+                Broker {
+                    config,
+                    router_tx,
+                    auth_tx,
+                }
             }
         }
     }
@@ -175,7 +196,7 @@ impl Broker {
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn start(&mut self, auth_tx: Option<mpsc::Sender<AuthMsg>>) -> Result<(), Error> {
+    pub fn start(&mut self) -> Result<(), Error> {
         if let Some(metrics_config) = self.config.metrics.clone() {
             let timer_thread = thread::Builder::new().name("timer".to_owned());
             let router_tx = self.router_tx.clone();
@@ -208,7 +229,7 @@ impl Broker {
         // Spawn servers in a separate thread.
         for (_, config) in self.config.v4.clone() {
             let server_thread = thread::Builder::new().name(config.name.clone());
-            let server = Server::new(config, self.router_tx.clone(), V4, auth_tx.clone());
+            let server = Server::new(config, self.router_tx.clone(), V4, self.auth_tx.clone());
             server_thread.spawn(move || {
                 let mut runtime = tokio::runtime::Builder::new_current_thread();
                 let runtime = runtime.enable_all().build().unwrap();
@@ -224,7 +245,7 @@ impl Broker {
         if let Some(v5_config) = &self.config.v5 {
             for (_, config) in v5_config.clone() {
                 let server_thread = thread::Builder::new().name(config.name.clone());
-                let server = Server::new(config, self.router_tx.clone(), V5, auth_tx.clone());
+                let server = Server::new(config, self.router_tx.clone(), V5, self.auth_tx.clone());
                 server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
@@ -322,7 +343,7 @@ struct Server<P> {
     config: ServerSettings,
     router_tx: Sender<(ConnectionId, Event)>,
     protocol: P,
-    auth_tx: Option<mpsc::Sender<AuthMsg>>
+    auth_tx: Option<mpsc::Sender<AuthMsg>>,
 }
 
 impl<P: Protocol + Clone + Send + 'static> Server<P> {
@@ -403,24 +424,36 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                         }
                     };
                     task::spawn(
-                        remote(config, tenant_id.clone(), router_tx, stream, protocol, self.auth_tx.clone()).instrument(
-                            tracing::info_span!(
-                                "websocket_link",
-                                client_id = field::Empty,
-                                connection_id = field::Empty
-                            ),
-                        ),
+                        remote(
+                            config,
+                            tenant_id.clone(),
+                            router_tx,
+                            stream,
+                            protocol,
+                            self.auth_tx.clone(),
+                        )
+                        .instrument(tracing::info_span!(
+                            "websocket_link",
+                            client_id = field::Empty,
+                            connection_id = field::Empty
+                        )),
                     )
                 }
                 LinkType::Remote => task::spawn(
-                    remote(config, tenant_id.clone(), router_tx, network, protocol, self.auth_tx.clone()).instrument(
-                        tracing::error_span!(
-                            "remote_link",
-                            ?tenant_id,
-                            client_id = field::Empty,
-                            connection_id = field::Empty,
-                        ),
-                    ),
+                    remote(
+                        config,
+                        tenant_id.clone(),
+                        router_tx,
+                        network,
+                        protocol,
+                        self.auth_tx.clone(),
+                    )
+                    .instrument(tracing::error_span!(
+                        "remote_link",
+                        ?tenant_id,
+                        client_id = field::Empty,
+                        connection_id = field::Empty,
+                    )),
                 ),
             };
 
@@ -458,18 +491,25 @@ async fn remote<P: Protocol>(
     router_tx: Sender<(ConnectionId, Event)>,
     stream: Box<dyn N>,
     protocol: P,
-    auth_tx: Option<mpsc::Sender<AuthMsg>>
+    auth_tx: Option<mpsc::Sender<AuthMsg>>,
 ) {
     let network = Network::new(stream, config.max_payload_size, 100, protocol);
     // Start the link
-    let mut link =
-        match RemoteLink::new(config, router_tx.clone(), tenant_id.clone(), network, auth_tx).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!(error=?e, "Remote link error");
-                return;
-            }
-        };
+    let mut link = match RemoteLink::new(
+        config,
+        router_tx.clone(),
+        tenant_id.clone(),
+        network,
+        auth_tx,
+    )
+    .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            error!(error=?e, "Remote link error");
+            return;
+        }
+    };
 
     let client_id = link.client_id.to_owned();
     let connection_id = link.connection_id;

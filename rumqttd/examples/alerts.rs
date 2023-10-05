@@ -15,7 +15,7 @@ fn main() {
 
     dbg!(&config);
 
-    let broker = Broker::new(config);
+    let broker = Broker::new(config, None);
     let alerts = broker.alerts().unwrap();
 
     let (mut link_tx, mut link_rx) = broker.link("consumer").unwrap();
