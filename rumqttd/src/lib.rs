@@ -38,7 +38,7 @@ pub use link::local;
 pub use link::meters;
 
 pub use router::{Alert, IncomingMeter, Meter, Notification, OutgoingMeter};
-pub use server::{AuthMsg, Broker};
+pub use server::{AuthLogin, AuthMsg, AuthPublish, AuthSubscribe, AuthType, Broker};
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Config {
